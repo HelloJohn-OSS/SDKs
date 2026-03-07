@@ -1,0 +1,716 @@
+import React, { useState, useEffect, useMemo } from "react";
+import { MFARequiredError, type MFAMethod, type MFAMethodType } from "@hellojohn/js";
+import { useAuth } from "../context";
+import { useI18n } from "../i18n";
+import { ThemeName, getTheme } from "../lib/themes";
+import { FactorSelectorChallenge } from "./FactorSelectorChallenge";
+import { useTurnstile } from "../hooks/useTurnstile";
+import { TurnstileWidget } from "./TurnstileWidget";
+
+export interface SignInProps {
+    onSuccess?: () => void;
+    redirectTo?: string;
+    /** URL for sign up page (default: /register) */
+    signUpUrl?: string;
+    /** URL for forgot password page (default: /forgot-password) */
+    forgotPasswordUrl?: string;
+    /** Hide the sign-up link */
+    hideSignUpLink?: boolean;
+    /** Theme name: "midnight" | "ocean" | "sunrise" | "forest" | "honey" | "minimal" | "auto" */
+    theme?: ThemeName;
+    /** Background image URL */
+    backgroundImage?: string;
+    /** Background blur intensity (0-20, default: 4) */
+    backgroundBlur?: number;
+    /** Form position: "left" | "center" | "right" (default: center) */
+    formPosition?: "left" | "center" | "right";
+    /** Enable glassmorphism effect */
+    glassmorphism?: boolean;
+    /** Custom style overrides */
+    customStyles?: {
+        primaryColor?: string;
+        borderRadius?: string;
+    };
+}
+
+interface PendingMFAChallenge {
+    token: string;
+    methods: MFAMethod[];
+    preferredFactor?: MFAMethodType;
+}
+
+function toMFAMethodType(value: unknown): MFAMethodType | null {
+    if (value !== "totp" && value !== "sms" && value !== "email") {
+        return null;
+    }
+    return value;
+}
+
+function methodLabel(type: MFAMethodType): string {
+    if (type === "totp") return "Authenticator App";
+    if (type === "sms") return "SMS";
+    return "Email";
+}
+
+/**
+ * SignIn component with built-in theming support.
+ * 
+ * @example
+ * // Simple usage
+ * <SignIn theme="midnight" />
+ * 
+ * @example
+ * // With background and glassmorphism
+ * <SignIn theme="ocean" backgroundImage="/hero.jpg" glassmorphism />
+ */
+export function SignIn({
+    onSuccess,
+    redirectTo = "/",
+    signUpUrl = "/register",
+    forgotPasswordUrl = "/forgot-password",
+    hideSignUpLink = false,
+    theme: themeName = "minimal",
+    backgroundImage,
+    backgroundBlur = 4,
+    formPosition = "center",
+    glassmorphism = false,
+    customStyles,
+}: SignInProps) {
+    const { loginWithCredentials, loginWithSocialProvider, config, providerStatus, isLoading, isAuthenticated, client } = useAuth();
+    const i18n = useI18n();
+    const { turnstileToken, onTurnstileVerify, resetTurnstile, turnstileRef } = useTurnstile();
+    const [email, setEmail] = useState("");
+    const [password, setPassword] = useState("");
+    const [error, setError] = useState("");
+    const [submitting, setSubmitting] = useState(false);
+    const [verificationNeeded, setVerificationNeeded] = useState(false);
+    const [resendStatus, setResendStatus] = useState<"idle" | "loading" | "sent" | "error">("idle");
+    const [showPassword, setShowPassword] = useState(false);
+    const [pendingMFA, setPendingMFA] = useState<PendingMFAChallenge | null>(null);
+    const [mounted, setMounted] = useState(false);
+    const [systemDark, setSystemDark] = useState(false);
+
+    useEffect(() => {
+        setMounted(true);
+        if (typeof window !== "undefined") {
+            setSystemDark(window.matchMedia("(prefers-color-scheme: dark)").matches);
+            const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+            const handler = (e: MediaQueryListEvent) => setSystemDark(e.matches);
+            mediaQuery.addEventListener("change", handler);
+            return () => mediaQuery.removeEventListener("change", handler);
+        }
+    }, []);
+
+    useEffect(() => {
+        if (!isLoading && isAuthenticated) {
+            if (onSuccess) {
+                onSuccess();
+            } else {
+                window.location.href = redirectTo;
+            }
+        }
+    }, [isLoading, isAuthenticated, onSuccess, redirectTo]);
+
+    // Get resolved theme
+    const resolvedThemeName = themeName === "auto" ? (systemDark ? "midnight" : "minimal") : themeName;
+    const theme = getTheme(resolvedThemeName as Exclude<ThemeName, "auto">);
+
+    // Apply custom overrides
+    const primaryColor = customStyles?.primaryColor || config?.primary_color || theme.colors.accent;
+    const borderRadius = customStyles?.borderRadius || theme.styles.borderRadius;
+
+    // Turnstile config for login protection
+    const botProtection = config?.bot_protection;
+    const loginTurnstileEnabled = !!(botProtection?.enabled && botProtection?.protectLogin && botProtection?.siteKey);
+
+    const handleSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setError("");
+        setPendingMFA(null);
+        setSubmitting(true);
+        try {
+            await loginWithCredentials(email, password, turnstileToken ?? undefined);
+            if (onSuccess) {
+                onSuccess();
+            } else {
+                window.location.href = redirectTo;
+            }
+        } catch (err: unknown) {
+            if (err instanceof MFARequiredError) {
+                const factors = err.availableFactors
+                    .map((factor) => toMFAMethodType(factor))
+                    .filter((factor): factor is MFAMethodType => factor !== null);
+                const methods = factors.length > 0
+                    ? factors.map((factor) => ({ type: factor, label: methodLabel(factor) }))
+                    : [{ type: "totp" as const, label: methodLabel("totp") }];
+                const preferredFactor = toMFAMethodType(err.preferredFactor);
+
+                setPendingMFA({
+                    token: err.mfaToken,
+                    methods,
+                    preferredFactor: preferredFactor || undefined,
+                });
+                setVerificationNeeded(false);
+                setError("");
+                return;
+            }
+
+            const errorCode =
+                typeof err === "object" &&
+                err !== null &&
+                "error" in err &&
+                typeof (err as { error?: unknown }).error === "string"
+                    ? (err as { error: string }).error
+                    : "";
+            const errorMessage = err instanceof Error ? err.message : "Login failed";
+
+            // Check for verification error (1211 or string match)
+            if (errorCode === "email_not_verified" || errorMessage.toLowerCase().includes("verificar")) {
+                setVerificationNeeded(true);
+                setError(i18n.signIn.verificationNeeded);
+            } else {
+                setError(errorMessage);
+            }
+            // Reset Turnstile so user can get a new token after failure
+            resetTurnstile();
+        } finally {
+            setSubmitting(false);
+        }
+    };
+
+    const handleResend = async () => {
+        console.log("[SignIn] handleResend called", { email });
+        if (!email) {
+            console.warn("[SignIn] No email state");
+            return;
+        }
+        setResendStatus("loading");
+        try {
+            console.log("[SignIn] client available:", !!client);
+            if (client && typeof client.resendVerificationEmail === 'function') {
+                console.log("[SignIn] calling resendVerificationEmail");
+                await client.resendVerificationEmail(email);
+                console.log("[SignIn] resend success");
+                setResendStatus("sent");
+                setError(""); // Clear error on success
+            } else {
+                console.error("[SignIn] Client not ready or method missing");
+                throw new Error("Client not ready");
+            }
+        } catch (e) {
+            console.error("[SignIn] Resend error", e);
+            setResendStatus("error");
+        }
+    };
+
+    // Styles
+    const justifyMap = { left: "flex-start", center: "center", right: "flex-end" };
+    const containerStyle: React.CSSProperties = {
+        position: backgroundImage ? "fixed" : undefined,
+        top: backgroundImage ? 0 : undefined,
+        left: backgroundImage ? 0 : undefined,
+        right: backgroundImage ? 0 : undefined,
+        bottom: backgroundImage ? 0 : undefined,
+        width: "100%",
+        minHeight: backgroundImage ? undefined : "100vh",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: justifyMap[formPosition],
+        padding: backgroundImage ? (formPosition === "center" ? "20px" : "20px 60px") : "20px",
+        background: backgroundImage
+            ? undefined
+            : theme.colors.background,
+        fontFamily: theme.styles.fontFamily,
+        zIndex: backgroundImage ? 9999 : undefined,
+    };
+
+    const bgStyle: React.CSSProperties = backgroundImage ? {
+        position: "absolute",
+        inset: 0,
+        backgroundImage: `url(${backgroundImage})`,
+        backgroundSize: "cover",
+        backgroundPosition: "center",
+        zIndex: 0,
+    } : {};
+
+    // Calculate overlay opacity based on blur (0 blur = no overlay)
+    const overlayOpacity = backgroundBlur > 0 ? Math.min(backgroundBlur * 0.04, 0.65) : 0;
+    const overlayStyle: React.CSSProperties = backgroundImage ? {
+        position: "absolute",
+        inset: 0,
+        background: overlayOpacity > 0
+            ? (theme.isDark ? `rgba(0,0,0,${overlayOpacity})` : `rgba(255,255,255,${overlayOpacity})`)
+            : "transparent",
+        backdropFilter: backgroundBlur > 0 ? `blur(${backgroundBlur}px)` : undefined,
+        WebkitBackdropFilter: backgroundBlur > 0 ? `blur(${backgroundBlur}px)` : undefined,
+        zIndex: 1,
+    } : {};
+
+    const cardStyle: React.CSSProperties = {
+        position: "relative",
+        zIndex: 2,
+        width: "100%",
+        maxWidth: "420px",
+        margin: backgroundImage ? undefined : "0 auto",
+        padding: "32px",
+        background: glassmorphism
+            ? (theme.isDark ? "rgba(15, 15, 26, 0.7)" : "rgba(255, 255, 255, 0.7)")
+            : theme.colors.cardBackground,
+        backdropFilter: glassmorphism ? "blur(16px) saturate(180%)" : undefined,
+        border: `1px solid ${theme.colors.cardBorder}`,
+        borderRadius,
+        boxShadow: theme.styles.cardShadow,
+        transition: theme.styles.transition,
+        opacity: mounted ? 1 : 0,
+        transform: mounted ? "translateY(0)" : "translateY(12px)",
+    };
+
+    const inputStyle: React.CSSProperties = {
+        display: "flex",
+        height: "44px",
+        width: "100%",
+        borderRadius: `calc(${borderRadius} - 4px)`,
+        border: `1px solid ${theme.colors.inputBorder}`,
+        background: theme.colors.inputBackground,
+        color: theme.colors.inputText,
+        padding: "0 14px",
+        fontSize: "15px",
+        outline: "none",
+        transition: theme.styles.transition,
+    };
+
+    const buttonStyle: React.CSSProperties = {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: "10px",
+        width: "100%",
+        height: "46px",
+        borderRadius: `calc(${borderRadius} - 2px)`,
+        border: "none",
+        background: theme.colors.buttonPrimary,
+        color: theme.colors.buttonPrimaryText,
+        fontSize: "15px",
+        fontWeight: 500,
+        cursor: submitting ? "not-allowed" : "pointer",
+        opacity: submitting ? 0.7 : 1,
+        transition: theme.styles.transition,
+    };
+
+    const socialButtonStyle: React.CSSProperties = {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: "10px",
+        width: "100%",
+        height: "46px",
+        borderRadius: `calc(${borderRadius} - 2px)`,
+        border: `1px solid ${theme.colors.buttonSecondaryBorder}`,
+        background: theme.colors.buttonSecondary,
+        color: theme.colors.buttonSecondaryText,
+        fontSize: "15px",
+        fontWeight: 500,
+        cursor: "pointer",
+        transition: theme.styles.transition,
+    };
+
+    const socialButtonContentStyle: React.CSSProperties = {
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: "10px",
+    };
+
+    /**
+     * Derive the list of social providers to display.
+     * Prefer `providerStatus` (real readiness from /v2/auth/providers) over `config.social_providers`.
+     * Only providers with `ready: true` are shown — never show a button for a misconfigured provider.
+     * Falls back to config.social_providers names if providerStatus hasn't loaded yet.
+     */
+    const socialProviders = useMemo(() => {
+        if (providerStatus.length > 0) {
+            // Use real readiness data from backend
+            return providerStatus
+                .filter(p => p.ready && p.name !== "password")
+                .map(p => p.name);
+        }
+        // Fallback: use config social_providers (may include not-ready providers)
+        const providers = config?.social_providers || [];
+        const unique = new Set<string>();
+        for (const provider of providers) {
+            const normalized = provider.toLowerCase().trim();
+            if (!normalized || normalized === "password") continue;
+            unique.add(normalized);
+        }
+        return Array.from(unique);
+    }, [providerStatus, config?.social_providers]);
+    const providerLabel = (provider: string) => {
+        const labels: Record<string, string> = {
+            google: "Google",
+            github: "GitHub",
+            facebook: "Facebook",
+            discord: "Discord",
+            microsoft: "Microsoft",
+            linkedin: "LinkedIn",
+            apple: "Apple",
+            gitlab: "GitLab",
+        };
+        return labels[provider] || (provider.charAt(0).toUpperCase() + provider.slice(1));
+    };
+
+    const SocialIcon = ({ provider }: { provider: string }) => {
+        if (provider === "google") {
+            return (
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4" />
+                    <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853" />
+                    <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05" />
+                    <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335" />
+                </svg>
+            );
+        }
+        if (provider === "github") {
+            return (
+                <svg width="20" height="20" viewBox="0 0 24 24" fill={theme.colors.inputText}>
+                    <path fillRule="evenodd" clipRule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.482 0-.237-.009-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.294 2.747-1.025 2.747-1.025.546 1.379.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.161 22 16.418 22 12c0-5.523-4.477-10-10-10z" />
+                </svg>
+            );
+        }
+        return null;
+    };
+
+    const hasSMTP = config?.features?.smtp_enabled;
+
+    if (isLoading) {
+        return (
+            <div style={{ ...containerStyle, justifyContent: "center", padding: "40px" }}>
+                <div style={{ color: theme.colors.textMuted, animation: "pulse 2s infinite" }}>
+                    {i18n.common.loading}
+                </div>
+            </div>
+        );
+    }
+
+    if (pendingMFA) {
+        const mfaContent = (
+            <>
+                <div style={{ textAlign: "center", marginBottom: "24px" }}>
+                    <h1 style={{
+                        fontSize: "24px",
+                        fontWeight: 700,
+                        color: theme.colors.textPrimary,
+                        margin: 0,
+                    }}>
+                        {config?.tenant_name || config?.client_name || i18n.signIn.title}
+                    </h1>
+                    <p style={{
+                        fontSize: "14px",
+                        color: theme.colors.textMuted,
+                        marginTop: "6px",
+                    }}>
+                        Two-factor authentication is required to continue
+                    </p>
+                </div>
+
+                <FactorSelectorChallenge
+                    challengeToken={pendingMFA.token}
+                    availableMethods={pendingMFA.methods}
+                    preferredFactor={pendingMFA.preferredFactor}
+                    onSuccess={() => {
+                        client?.mfa.clearChallenge();
+                        setPendingMFA(null);
+                        setError("");
+                        if (onSuccess) {
+                            onSuccess();
+                            return;
+                        }
+                        window.location.href = redirectTo;
+                    }}
+                    onCancel={() => {
+                        client?.mfa.clearChallenge();
+                        setPendingMFA(null);
+                        setError("");
+                    }}
+                />
+            </>
+        );
+
+        if (backgroundImage) {
+            return (
+                <div style={containerStyle}>
+                    <div style={bgStyle} />
+                    <div style={overlayStyle} />
+                    <div style={cardStyle}>
+                        {mfaContent}
+                    </div>
+                </div>
+            );
+        }
+
+        return (
+            <div style={containerStyle}>
+                <div style={cardStyle}>
+                    {mfaContent}
+                </div>
+            </div>
+        );
+    }
+
+    const formContent = (
+        <>
+            {/* Header */}
+            <div style={{ textAlign: "center", marginBottom: "28px" }}>
+                {config?.logo_url && (
+                    <img
+                        src={config.logo_url}
+                        alt={config.tenant_name || config.client_name}
+                        style={{ height: "48px", marginLeft: "auto", marginRight: "auto", marginBottom: "16px", display: "block" }}
+                        onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                    />
+                )}
+                <h1 style={{
+                    fontSize: "26px",
+                    fontWeight: 700,
+                    color: theme.colors.textPrimary,
+                    margin: 0,
+                }}>
+                    {config?.tenant_name || config?.client_name || i18n.signIn.title}
+                </h1>
+                <p style={{
+                    fontSize: "15px",
+                    color: theme.colors.textMuted,
+                    marginTop: "6px",
+                }}>
+                    {i18n.signIn.subtitle}
+                </p>
+            </div>
+
+            {/* Error & Verification */}
+            {(error || verificationNeeded) && (
+                <div style={{
+                    padding: "14px",
+                    marginBottom: "20px",
+                    fontSize: "14px",
+                    color: verificationNeeded && resendStatus === "sent" ? "#15803d" : theme.colors.error,
+                    background: verificationNeeded && resendStatus === "sent" ? "#dcfce7" : theme.colors.errorBackground,
+                    border: `1px solid ${verificationNeeded && resendStatus === "sent" ? "#86efac" : theme.colors.errorBorder}`,
+                    borderRadius: `calc(${borderRadius} - 4px)`,
+                }}>
+                    {resendStatus === "sent" ? i18n.signIn.verificationResent : error}
+
+                    {verificationNeeded && resendStatus !== "sent" && (
+                        <div style={{ marginTop: "10px" }}>
+                            <button
+                                type="button"
+                                onClick={handleResend}
+                                disabled={resendStatus === "loading"}
+                                style={{
+                                    background: "transparent",
+                                    border: "none",
+                                    padding: 0,
+                                    color: theme.colors.link,
+                                    textDecoration: "underline",
+                                    fontSize: "13px",
+                                    cursor: "pointer",
+                                    fontWeight: 500
+                                }}
+                            >
+                                {resendStatus === "loading" ? i18n.signIn.resending : i18n.signIn.resendVerification}
+                            </button>
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {/* Social Login */}
+            {socialProviders.length > 0 && (
+                <div style={{ marginBottom: "24px" }}>
+                    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                        {socialProviders.map((provider) => (
+                            <button
+                                key={provider}
+                                type="button"
+                                onClick={() => loginWithSocialProvider(provider)}
+                                style={socialButtonStyle}
+                                onMouseEnter={(e) => e.currentTarget.style.background = theme.colors.buttonSecondaryHover}
+                                onMouseLeave={(e) => e.currentTarget.style.background = theme.colors.buttonSecondary}
+                            >
+                                <span style={socialButtonContentStyle}>
+                                    <SocialIcon provider={provider} />
+                                    <span>{i18n.signIn.socialButtonPrefix} {providerLabel(provider)}</span>
+                                </span>
+                            </button>
+                        ))}
+                    </div>
+                    <div style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "16px",
+                        margin: "20px 0",
+                    }}>
+                        <div style={{ flex: 1, height: "1px", background: theme.colors.inputBorder }} />
+                        <span style={{ fontSize: "13px", color: theme.colors.textMuted, textTransform: "uppercase" }}>
+                            {i18n.signIn.socialDivider}
+                        </span>
+                        <div style={{ flex: 1, height: "1px", background: theme.colors.inputBorder }} />
+                    </div>
+                </div>
+            )}
+
+            {/* Form */}
+            <form onSubmit={handleSubmit}>
+                <div style={{ marginBottom: "18px" }}>
+                    <label style={{
+                        display: "block",
+                        fontSize: "14px",
+                        fontWeight: 500,
+                        color: theme.colors.textPrimary,
+                        marginBottom: "8px",
+                    }}>
+                        {i18n.signIn.emailLabel}
+                    </label>
+                    <input
+                        type="email"
+                        value={email}
+                        onChange={e => setEmail(e.target.value)}
+                        placeholder={i18n.signIn.emailPlaceholder}
+                        required
+                        disabled={submitting}
+                        style={inputStyle}
+                        onFocus={(e) => e.currentTarget.style.borderColor = primaryColor}
+                        onBlur={(e) => e.currentTarget.style.borderColor = theme.colors.inputBorder}
+                    />
+                </div>
+
+                <div style={{ marginBottom: "24px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
+                        <label style={{
+                            fontSize: "14px",
+                            fontWeight: 500,
+                            color: theme.colors.textPrimary,
+                        }}>
+                            {i18n.signIn.passwordLabel}
+                        </label>
+                        {hasSMTP && (
+                            <a
+                                href={forgotPasswordUrl}
+                                style={{
+                                    fontSize: "13px",
+                                    color: theme.colors.link,
+                                    textDecoration: "none",
+                                }}
+                            >
+                                {i18n.signIn.forgotPasswordLink}
+                            </a>
+                        )}
+                    </div>
+                    <div style={{ position: "relative" }}>
+                        <input
+                            type={showPassword ? "text" : "password"}
+                            value={password}
+                            onChange={e => setPassword(e.target.value)}
+                            required
+                            disabled={submitting}
+                            style={{ ...inputStyle, paddingRight: "44px" }}
+                            onFocus={(e) => e.currentTarget.style.borderColor = primaryColor}
+                            onBlur={(e) => e.currentTarget.style.borderColor = theme.colors.inputBorder}
+                        />
+                        <button
+                            type="button"
+                            onClick={() => setShowPassword(!showPassword)}
+                            style={{
+                                position: "absolute",
+                                right: "12px",
+                                top: "50%",
+                                transform: "translateY(-50%)",
+                                background: "none",
+                                border: "none",
+                                padding: "4px",
+                                cursor: "pointer",
+                                color: theme.colors.textMuted,
+                            }}
+                        >
+                            {showPassword ? (
+                                <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                                    <path strokeLinecap="round" strokeLinejoin="round" d="M3.98 8.223A10.477 10.477 0 001.934 12C3.226 16.338 7.244 19.5 12 19.5c.993 0 1.953-.138 2.863-.395M6.228 6.228A10.45 10.45 0 0112 4.5c4.756 0 8.773 3.162 10.065 7.498a10.523 10.523 0 01-4.293 5.774M6.228 6.228L3 3m3.228 3.228l3.65 3.65m7.894 7.894L21 21m-3.228-3.228l-3.65-3.65m0 0a3 3 0 10-4.243-4.243m4.242 4.242L9.88 9.88" />
+                                </svg>
+                            ) : (
+                                <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                                    <path strokeLinecap="round" strokeLinejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" />
+                                    <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                </svg>
+                            )}
+                        </button>
+                    </div>
+                </div>
+
+                {/* Turnstile bot-protection widget */}
+                {loginTurnstileEnabled && (
+                    <TurnstileWidget
+                        siteKey={botProtection!.siteKey!}
+                        onVerify={onTurnstileVerify}
+                        ref={turnstileRef}
+                        theme={(botProtection?.theme as "light" | "dark" | "auto") || "auto"}
+                        appearance={(botProtection?.appearance as "always" | "execute" | "interaction-only") || "always"}
+                    />
+                )}
+
+                <button
+                    type="submit"
+                    disabled={submitting || (loginTurnstileEnabled && !turnstileToken)}
+                    style={{
+                        ...buttonStyle,
+                        opacity: (submitting || (loginTurnstileEnabled && !turnstileToken)) ? 0.7 : 1,
+                        cursor: (submitting || (loginTurnstileEnabled && !turnstileToken)) ? "not-allowed" : "pointer",
+                    }}
+                >
+                    {submitting ? i18n.signIn.submitting : i18n.signIn.submitButton}
+                </button>
+            </form>
+
+            {/* Sign Up Link */}
+            {!hideSignUpLink && (
+                <p style={{
+                    textAlign: "center",
+                    marginTop: "24px",
+                    fontSize: "14px",
+                    color: theme.colors.textSecondary,
+                }}>
+                    {i18n.signIn.noAccountText}{" "}
+                    <a
+                        href={signUpUrl}
+                        style={{
+                            color: theme.colors.link,
+                            fontWeight: 500,
+                            textDecoration: "none",
+                        }}
+                    >
+                        {i18n.signIn.signUpLink}
+                    </a>
+                </p>
+            )}
+        </>
+    );
+
+    // If background image, wrap in full container
+    if (backgroundImage) {
+        return (
+            <div style={containerStyle}>
+                <div style={bgStyle} />
+                <div style={overlayStyle} />
+                <div style={cardStyle}>
+                    {formContent}
+                </div>
+            </div>
+        );
+    }
+
+    // Default: just the card
+    return (
+        <div style={containerStyle}>
+            <div style={cardStyle}>
+                {formContent}
+            </div>
+        </div>
+    );
+}
